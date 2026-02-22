@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+"""
+new Env('B站日常助手');
+cron: 15 9 * * *
+"""
+
 import requests
 import os
 import time

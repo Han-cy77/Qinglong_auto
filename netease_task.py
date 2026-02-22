@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+"""
+new Env('网易云全能打卡');
+cron: 30 9 * * *
+"""
+
 import requests
 import os
 import time
