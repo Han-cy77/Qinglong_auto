@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
 这是一个专为 [青龙面板](https://github.com/whyour/qinglong) 打造的日常自动化脚本库。主打**极简、稳定、防封**。
-全部脚本基于纯 Python 编写，无需配置复杂的 Node.js 环境，小白也能一键跑通！
+全部脚本基于纯 Python 编写，无需配置复杂的 Node.js 环境。
 
 ## 🌟 核心特色
 
