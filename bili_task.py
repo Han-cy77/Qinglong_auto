@@ -8,6 +8,7 @@ import requests
 import os
 import time
 import re
+import random
 
 # ================= 配置区域 =================
 BARK_URL = 'https://api.day.app/在此处添加自己的bark推送id'
@@ -59,12 +60,21 @@ def do_bili_task():
         share_exp = reward_data.get('share')  # 是否完成分享
         coin_exp = reward_data.get('coins', 0)  # 今日已投币获得的经验
 
-        # 3. 获取全站排行榜第一的视频，用来执行观看和分享任务
-        rank_url = "https://api.bilibili.com/x/web-interface/ranking/v2?rid=0&type=all"
-        rank_res = requests.get(rank_url, headers=headers).json()
-        bvid = rank_res['data']['list'][0]['bvid']
-        video_title = rank_res['data']['list'][0]['title']
-        msg_list.append(f"🎯 今日锁定视频：《{video_title[:10]}...》")
+        # 3. 获取 B 站全站热门推荐视频，避免重复投币
+        # 获取热门推荐的前 50 个视频
+        popular_url = "https://api.bilibili.com/x/web-interface/popular?ps=50&pn=1"
+        pop_res = requests.get(popular_url, headers=headers).json()
+
+        if pop_res.get('code') == 0:
+            video_list = pop_res['data']['list']
+            # 从这 50 个热门推荐视频中随机盲抽一个
+            random_video = random.choice(video_list)
+            bvid = random_video['bvid']
+            video_title = random_video['title']
+        else:
+            return f"❌ 获取推荐视频失败: {pop_res.get('message')}"
+
+        msg_list.append(f"🎯 今日随机推荐视频：《{video_title[:10]}...》")
 
         # 4. 模拟观看视频
         if not watch_exp:
