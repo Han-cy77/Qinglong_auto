@@ -20,16 +20,17 @@ def get_bili_csrf(cookie):
     match = re.search(r'bili_jct=([^;]+)', cookie)
     return match.group(1) if match else ""
 
-
 def do_bili_task():
     cookie = os.getenv('BILI_COOKIE')
     if not cookie:
         return "⚠️ B站任务失败：未在青龙环境变量中找到 BILI_COOKIE"
 
+    # 修复1：补全了 Origin 头，这对 B 站的 POST 请求(观看/分享/投币)非常重要，防止报 -403
     headers = {
         "Cookie": cookie,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://www.bilibili.com/"
+        "Referer": "https://www.bilibili.com/",
+        "Origin": "https://www.bilibili.com"
     }
 
     csrf = get_bili_csrf(cookie)
@@ -61,15 +62,14 @@ def do_bili_task():
         coin_exp = reward_data.get('coins', 0)  # 今日已投币获得的经验
 
         # 3. 获取 B 站全站热门推荐视频，避免重复投币
-        # 获取热门推荐的前 50 个视频
         popular_url = "https://api.bilibili.com/x/web-interface/popular?ps=50&pn=1"
         pop_res = requests.get(popular_url, headers=headers).json()
 
         if pop_res.get('code') == 0:
             video_list = pop_res['data']['list']
-            # 从这 50 个热门推荐视频中随机盲抽一个
             random_video = random.choice(video_list)
             bvid = random_video['bvid']
+            aid = random_video['aid']  # 修复2：同时获取 aid，有些老接口强依赖 aid
             video_title = random_video['title']
         else:
             return f"❌ 获取推荐视频失败: {pop_res.get('message')}"
@@ -79,16 +79,33 @@ def do_bili_task():
         # 4. 模拟观看视频
         if not watch_exp:
             watch_url = "https://api.bilibili.com/x/click-interface/web/heartbeat"
-            requests.post(watch_url, data={"bvid": bvid, "csrf": csrf, "played_time": 30}, headers=headers)
-            msg_list.append("📺 观看任务：✅ 已完成 (+5经验)")
+            watch_data = {"aid": aid, "bvid": bvid, "csrf": csrf, "played_time": 300}
+            # 修复3：增加对返回结果的验证
+            w_res = requests.post(watch_url, data=watch_data, headers=headers).json()
+            if w_res.get('code') == 0:
+                msg_list.append("📺 观看任务：✅ 已完成 (+5经验)")
+            else:
+                msg_list.append(f"📺 观看任务：❌ 失败 ({w_res.get('message')})")
+            time.sleep(2)  # 修复4：增加安全延迟，防风控
         else:
             msg_list.append("📺 观看任务：☕ 今日已达标")
 
         # 5. 模拟分享视频
         if not share_exp:
             share_url = "https://api.bilibili.com/x/web-interface/share/add"
-            requests.post(share_url, data={"bvid": bvid, "csrf": csrf}, headers=headers)
-            msg_list.append("↗️ 分享任务：✅ 已完成 (+5经验)")
+            # 修复5：增加了 aid 和 share_channel 参数，模拟真实“复制链接”的分享动作
+            share_data = {
+                "aid": aid,
+                "bvid": bvid,
+                "csrf": csrf,
+                "share_channel": "copy"
+            }
+            s_res = requests.post(share_url, data=share_data, headers=headers).json()
+            if s_res.get('code') == 0:
+                msg_list.append("↗️ 分享任务：✅ 已完成 (+5经验)")
+            else:
+                msg_list.append(f"↗️ 分享任务：❌ 失败 (code:{s_res.get('code')} - {s_res.get('message')})")
+            time.sleep(2) # 安全延迟
         else:
             msg_list.append("↗️ 分享任务：☕ 今日已达标")
 
@@ -97,13 +114,19 @@ def do_bili_task():
         if TOSS_COIN_COUNT > 0:
             if coin_exp < target_coins_exp and coins > 0:
                 coin_url = "https://api.bilibili.com/x/web-interface/coin/add"
-                coin_data = {"bvid": bvid, "multiply": TOSS_COIN_COUNT, "select_like": 1, "cross_domain": "true",
-                             "csrf": csrf}
+                coin_data = {
+                    "aid": aid,
+                    "bvid": bvid,
+                    "multiply": TOSS_COIN_COUNT,
+                    "select_like": 1,
+                    "cross_domain": "true",
+                    "csrf": csrf
+                }
                 c_res = requests.post(coin_url, data=coin_data, headers=headers).json()
                 if c_res.get('code') == 0:
                     msg_list.append(f"🪙 投币任务：✅ 成功投出{TOSS_COIN_COUNT}枚硬币 (+{TOSS_COIN_COUNT * 10}经验)")
                 else:
-                    msg_list.append(f"🪙 投币任务：❌ 失败 ({c_res.get('message')})")
+                    msg_list.append(f"🪙 投币任务：❌ 失败 (code:{c_res.get('code')} - {c_res.get('message')})")
             elif coin_exp >= target_coins_exp:
                 msg_list.append(f"🪙 投币任务：☕ 今日投币量已达标")
             else:
@@ -124,7 +147,7 @@ def send_bark(title, content):
         "title": title,
         "body": content,
         "group": "B站日常助手",
-        "icon": "https://cdn-icons-png.flaticon.com/512/3178/3178168.png"  # 换了个电视/视频小图标
+        "icon": "https://cdn-icons-png.flaticon.com/512/3178/3178168.png"
     }
     try:
         requests.post(base_url, json=data)
