@@ -9,6 +9,9 @@ import os
 import time
 import re
 import random
+import datetime
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= 配置区域 =================
 BARK_URL = 'https://api.day.app/在此处添加自己的bark推送id'
@@ -20,11 +23,36 @@ def get_bili_csrf(cookie):
     match = re.search(r'bili_jct=([^;]+)', cookie)
     return match.group(1) if match else ""
 
-def do_bili_task():
-    cookie = os.getenv('BILI_COOKIE')
-    if not cookie:
-        return "⚠️ B站任务失败：未在青龙环境变量中找到 BILI_COOKIE"
+def get_bili_uid(cookie):
+    match = re.search(r'DedeUserID=([^;]+)', cookie)
+    return match.group(1) if match else "Unknown"
 
+def setup_logger(account_name, task_name):
+    log_dir = "logs"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    date_str = datetime.datetime.now().strftime('%Y%m%d')
+    log_file = f"{log_dir}/{task_name}_{account_name}_{date_str}.log"
+    
+    logger = logging.getLogger(f"{task_name}_{account_name}")
+    logger.setLevel(logging.INFO)
+    
+    # 清除旧的 handlers
+    if logger.handlers:
+        logger.handlers = []
+
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    return logger
+
+def do_bili_task(cookie, index):
+    account_uid = get_bili_uid(cookie)
+    logger = setup_logger(f"Account{index}_{account_uid}", "Bilibili")
+    
     # 修复1：补全了 Origin 头，这对 B 站的 POST 请求(观看/分享/投币)非常重要，防止报 -403
     headers = {
         "Cookie": cookie,
@@ -35,23 +63,31 @@ def do_bili_task():
 
     csrf = get_bili_csrf(cookie)
     if not csrf:
-        return "❌ Cookie格式错误：缺少 bili_jct 字段，请重新抓取完整的 Cookie。"
+        msg = "❌ Cookie格式错误：缺少 bili_jct 字段，请重新抓取完整的 Cookie。"
+        logger.error(msg)
+        return f"Account {index}: {msg}"
 
     msg_list = []
+    
+    def log_and_append(msg):
+        logger.info(msg)
+        msg_list.append(msg)
 
     try:
         # 1. 检查登录状态并获取用户信息
         nav_url = "https://api.bilibili.com/x/web-interface/nav"
         res = requests.get(nav_url, headers=headers).json()
         if res.get('code') != 0:
-            return f"❌ 登录失效，请重新抓取 B 站 Cookie！"
+            msg = f"❌ 登录失效，请重新抓取 B 站 Cookie！"
+            log_and_append(msg)
+            return "\n".join(msg_list)
 
         data = res['data']
         uname = data['uname']
         level = data['level_info']['current_level']
         coins = data['money']
-        msg_list.append(f"👤 账号：{uname} (Lv{level})")
-        msg_list.append(f"💰 硬币余额：{coins}枚")
+        log_and_append(f"👤 账号：{uname} (Lv{level})")
+        log_and_append(f"💰 硬币余额：{coins}枚")
 
         # 2. 获取今日任务完成状态
         reward_url = "https://api.bilibili.com/x/member/web/exp/reward"
@@ -72,9 +108,11 @@ def do_bili_task():
             aid = random_video['aid']  # 修复2：同时获取 aid，有些老接口强依赖 aid
             video_title = random_video['title']
         else:
-            return f"❌ 获取推荐视频失败: {pop_res.get('message')}"
+            msg = f"❌ 获取推荐视频失败: {pop_res.get('message')}"
+            log_and_append(msg)
+            return "\n".join(msg_list)
 
-        msg_list.append(f"🎯 今日随机推荐视频：《{video_title[:10]}...》")
+        log_and_append(f"🎯 今日随机推荐视频：《{video_title[:10]}...》")
 
         # 4. 模拟观看视频
         if not watch_exp:
@@ -83,12 +121,12 @@ def do_bili_task():
             # 修复3：增加对返回结果的验证
             w_res = requests.post(watch_url, data=watch_data, headers=headers).json()
             if w_res.get('code') == 0:
-                msg_list.append("📺 观看任务：✅ 已完成 (+5经验)")
+                log_and_append("📺 观看任务：✅ 已完成 (+5经验)")
             else:
-                msg_list.append(f"📺 观看任务：❌ 失败 ({w_res.get('message')})")
+                log_and_append(f"📺 观看任务：❌ 失败 ({w_res.get('message')})")
             time.sleep(2)  # 修复4：增加安全延迟，防风控
         else:
-            msg_list.append("📺 观看任务：☕ 今日已达标")
+            log_and_append("📺 观看任务：☕ 今日已达标")
 
         # 5. 模拟分享视频
         if not share_exp:
@@ -102,12 +140,12 @@ def do_bili_task():
             }
             s_res = requests.post(share_url, data=share_data, headers=headers).json()
             if s_res.get('code') == 0:
-                msg_list.append("↗️ 分享任务：✅ 已完成 (+5经验)")
+                log_and_append("↗️ 分享任务：✅ 已完成 (+5经验)")
             else:
-                msg_list.append(f"↗️ 分享任务：❌ 失败 (code:{s_res.get('code')} - {s_res.get('message')})")
+                log_and_append(f"↗️ 分享任务：❌ 失败 (code:{s_res.get('code')} - {s_res.get('message')})")
             time.sleep(2) # 安全延迟
         else:
-            msg_list.append("↗️ 分享任务：☕ 今日已达标")
+            log_and_append("↗️ 分享任务：☕ 今日已达标")
 
         # 6. 执行自动投币
         target_coins_exp = TOSS_COIN_COUNT * 10
@@ -124,18 +162,19 @@ def do_bili_task():
                 }
                 c_res = requests.post(coin_url, data=coin_data, headers=headers).json()
                 if c_res.get('code') == 0:
-                    msg_list.append(f"🪙 投币任务：✅ 成功投出{TOSS_COIN_COUNT}枚硬币 (+{TOSS_COIN_COUNT * 10}经验)")
+                    log_and_append(f"🪙 投币任务：✅ 成功投出{TOSS_COIN_COUNT}枚硬币 (+{TOSS_COIN_COUNT * 10}经验)")
                 else:
-                    msg_list.append(f"🪙 投币任务：❌ 失败 (code:{c_res.get('code')} - {c_res.get('message')})")
+                    log_and_append(f"🪙 投币任务：❌ 失败 (code:{c_res.get('code')} - {c_res.get('message')})")
             elif coin_exp >= target_coins_exp:
-                msg_list.append(f"🪙 投币任务：☕ 今日投币量已达标")
+                log_and_append(f"🪙 投币任务：☕ 今日投币量已达标")
             else:
-                msg_list.append(f"🪙 投币任务：⚠️ 硬币余额不足")
+                log_and_append(f"🪙 投币任务：⚠️ 硬币余额不足")
         else:
-            msg_list.append("🪙 投币任务：设置了不投币")
+            log_and_append("🪙 投币任务：设置了不投币")
 
     except Exception as e:
-        msg_list.append(f"❌ 执行任务时发生错误: {e}")
+        msg = f"❌ 执行任务时发生错误: {e}"
+        log_and_append(msg)
 
     return "\n".join(msg_list)
 
@@ -155,12 +194,48 @@ def send_bark(title, content):
         pass
 
 
+def get_cookies():
+    cookie_str = os.getenv('BILI_COOKIE', '')
+    if not cookie_str:
+        return []
+    # 支持换行或&符号分割多账号
+    if '&' in cookie_str and 'bili_jct' not in cookie_str.split('&')[0]:
+         # 如果cookie内部本身不含&（bili_jct通常不含&，但cookie字段间用;），
+         # 这里假设用户用&分割了多个完整cookie字符串
+         return [c.strip() for c in cookie_str.split('&') if c.strip()]
+    
+    # 简单的按行分割，或者如果是一行且包含多个cookie（这种情况较少，通常是多行）
+    if '\n' in cookie_str:
+        return [c.strip() for c in cookie_str.split('\n') if c.strip()]
+    
+    # 单个账号
+    return [cookie_str]
+
 if __name__ == '__main__':
     print(f"开始执行 B 站日常任务... {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    result_msg = do_bili_task()
+    
+    cookies = get_cookies()
+    if not cookies:
+        print("⚠️ 未在青龙环境变量中找到 BILI_COOKIE")
+        exit(0)
+
+    print(f"检测到 {len(cookies)} 个账号，准备并发执行...")
+    
+    results = []
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(do_bili_task, cookie, i+1): i for i, cookie in enumerate(cookies)}
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                res = future.result()
+                results.append(f"--- 账号 {idx + 1} 执行结果 ---\n{res}")
+            except Exception as exc:
+                results.append(f"--- 账号 {idx + 1} 执行异常 ---\n{exc}")
+
+    final_msg = "\n\n".join(results)
     print("=" * 30)
-    print(result_msg)
+    print(final_msg)
     print("=" * 30)
 
-    send_bark("📺 B站自动签到与升级", result_msg)
-    print("任务执行完毕。")
+    send_bark("📺 B站自动签到与升级", final_msg)
+    print("所有任务执行完毕。")

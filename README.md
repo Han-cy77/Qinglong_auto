@@ -49,18 +49,68 @@
 
 ---
 
-## ⚙️ 环境变量配置
+## ⚙️ 环境变量与多账号配置
 
-请在青龙面板的 **环境变量** 中添加以下变量，才能让脚本认出你的账号：
+请在青龙面板的 **环境变量** 中添加以下变量。脚本会自动识别单账号或多账号模式。
 
-| 变量名称 | 必须 | 说明与获取方式 |
-| :--- | :---: | :--- |
-| `BILI_COOKIE` | 否 | **B站通行证**。网页端登录后 F12 抓取 `bilibili.com` 的完整 Cookie。 |
-| `NETEASE_COOKIE` | 否 | **网易云通行证**。网页端抓取，格式必须为：`MUSIC_U=你的值; __csrf=你的值;` |
+| 变量名称 | 说明 | 多账号支持 |
+| :--- | :--- | :--- |
+| `BILI_COOKIE` | **B站通行证**。网页端登录后 F12 抓取 `bilibili.com` 的完整 Cookie。 | **支持**。多个 Cookie 之间用 `&` 符号或换行符分隔。 |
+| `NETEASE_COOKIE` | **网易云通行证**。网页端抓取，格式必须为：`MUSIC_U=xx; __csrf=xx;` | **支持**。多个 Cookie 之间用 `&` 符号或换行符分隔。 |
 
-*(注：你跑哪个脚本，就配哪个变量即可。不跑的无需配置。)*
+### 👥 多账号配置示例
+
+**方式一：使用 `&` 连接（推荐）**
+在青龙面板添加环境变量时，直接将多个账号的 Cookie 用 `&` 符号连接：
+> Value: `Cookie1String&Cookie2String&Cookie3String`
+
+**方式二：使用换行符**
+在环境变量的值中，每行输入一个账号的 Cookie（适用于 Cookie 较长的情况）。
 
 ---
+
+## 🧵 并发执行与独立日志
+
+为提升多账号执行效率，脚本已重构为**多线程并发模式**：
+
+1. **并发执行**：
+   * 脚本会自动检测环境变量中的账号数量。
+   * 默认启用 3 个并发线程同时执行任务，单个账号失败不会影响其他账号。
+
+2. **独立日志记录**：
+   * 每次执行都会在 `logs/` 目录下生成独立的账号日志文件。
+   * **命名格式**：`任务名_账号名称_日期.log`
+     * 示例 1：`Bilibili_Account1_123456_20231027.log`
+     * 示例 2：`Netease_MyNickname_20231027.log`
+   * 方便用户单独排查某个账号的执行情况。
+
+---
+
+## 💻 命令行使用示例
+
+如果你喜欢在本地终端或 SSH 中手动运行，也可以通过设置临时环境变量来调用：
+
+**示例 1：单账号执行**
+```bash
+# Windows Powershell
+$env:BILI_COOKIE="你的Cookie"; python bili_task.py
+
+# Linux / MacOS
+export BILI_COOKIE="你的Cookie" && python3 bili_task.py
+```
+
+**示例 2：多账号并发执行**
+```bash
+# Windows Powershell
+$env:BILI_COOKIE="Cookie1&Cookie2"; python bili_task.py
+
+# Linux / MacOS
+export BILI_COOKIE="Cookie1&Cookie2" && python3 bili_task.py
+```
+*(注：执行后控制台将显示汇总报告，详细日志请查看 logs 目录)*
+
+---
+
 
 ## 🔔 推送配置说明
 
