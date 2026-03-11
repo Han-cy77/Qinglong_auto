@@ -53,12 +53,15 @@ def do_bili_task(cookie, index):
     account_uid = get_bili_uid(cookie)
     logger = setup_logger(f"Account{index}_{account_uid}", "Bilibili")
     
-    # 修复1：补全了 Origin 头，这对 B 站的 POST 请求(观看/分享/投币)非常重要，防止报 -403
+    # 修复：极大地丰富了请求头，降低被 WAF (防火墙) 风控的概率
     headers = {
         "Cookie": cookie,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://www.bilibili.com/",
-        "Origin": "https://www.bilibili.com"
+        "Origin": "https://www.bilibili.com",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Connection": "keep-alive"
     }
 
     csrf = get_bili_csrf(cookie)
@@ -73,12 +76,31 @@ def do_bili_task(cookie, index):
         logger.info(msg)
         msg_list.append(msg)
 
+    # ================= 安全请求拦截器 =================
+    def safe_request_json(method, url, **kwargs):
+        """安全地发起请求并解析 JSON，防止 B 站返回 HTML 导致报错"""
+        try:
+            if method.upper() == 'GET':
+                response = requests.get(url, **kwargs)
+            else:
+                response = requests.post(url, **kwargs)
+                
+            return response.json()
+        except requests.exceptions.JSONDecodeError:
+            log_and_append(f"❌ 接口被拦截！状态码: {response.status_code}")
+            log_and_append(f"⚠️ 返回异常内容片段: {response.text[:150]}")
+            return None
+        except Exception as e:
+            log_and_append(f"❌ 请求发生未知网络异常: {e}")
+            return None
+    # ==================================================
+
     try:
         # 1. 检查登录状态并获取用户信息
         nav_url = "https://api.bilibili.com/x/web-interface/nav"
-        res = requests.get(nav_url, headers=headers).json()
-        if res.get('code') != 0:
-            msg = f"❌ 登录失效，请重新抓取 B 站 Cookie！"
+        res = safe_request_json('GET', nav_url, headers=headers)
+        if not res or res.get('code') != 0:
+            msg = "❌ 登录失效或接口被拦截，请检查 Cookie 或 IP 是否被风控！"
             log_and_append(msg)
             return "\n".join(msg_list)
 
@@ -91,7 +113,10 @@ def do_bili_task(cookie, index):
 
         # 2. 获取今日任务完成状态
         reward_url = "https://api.bilibili.com/x/member/web/exp/reward"
-        reward_res = requests.get(reward_url, headers=headers).json()
+        reward_res = safe_request_json('GET', reward_url, headers=headers)
+        if not reward_res:
+            return "\n".join(msg_list) # 接口被拦截，直接终止该账号后续任务
+            
         reward_data = reward_res.get('data', {})
         watch_exp = reward_data.get('watch')  # 是否完成观看
         share_exp = reward_data.get('share')  # 是否完成分享
@@ -99,16 +124,16 @@ def do_bili_task(cookie, index):
 
         # 3. 获取 B 站全站热门推荐视频，避免重复投币
         popular_url = "https://api.bilibili.com/x/web-interface/popular?ps=50&pn=1"
-        pop_res = requests.get(popular_url, headers=headers).json()
+        pop_res = safe_request_json('GET', popular_url, headers=headers)
 
-        if pop_res.get('code') == 0:
+        if pop_res and pop_res.get('code') == 0:
             video_list = pop_res['data']['list']
             random_video = random.choice(video_list)
             bvid = random_video['bvid']
-            aid = random_video['aid']  # 修复2：同时获取 aid，有些老接口强依赖 aid
+            aid = random_video['aid']
             video_title = random_video['title']
         else:
-            msg = f"❌ 获取推荐视频失败: {pop_res.get('message')}"
+            msg = f"❌ 获取推荐视频失败: {pop_res.get('message') if pop_res else '接口被拦截'}"
             log_and_append(msg)
             return "\n".join(msg_list)
 
@@ -118,31 +143,32 @@ def do_bili_task(cookie, index):
         if not watch_exp:
             watch_url = "https://api.bilibili.com/x/click-interface/web/heartbeat"
             watch_data = {"aid": aid, "bvid": bvid, "csrf": csrf, "played_time": 300}
-            # 修复3：增加对返回结果的验证
-            w_res = requests.post(watch_url, data=watch_data, headers=headers).json()
-            if w_res.get('code') == 0:
+            
+            w_res = safe_request_json('POST', watch_url, data=watch_data, headers=headers)
+            if w_res and w_res.get('code') == 0:
                 log_and_append("📺 观看任务：✅ 已完成 (+5经验)")
             else:
-                log_and_append(f"📺 观看任务：❌ 失败 ({w_res.get('message')})")
-            time.sleep(2)  # 修复4：增加安全延迟，防风控
+                err_msg = w_res.get('message') if w_res else '接口解析失败'
+                log_and_append(f"📺 观看任务：❌ 失败 ({err_msg})")
+            time.sleep(2)  # 安全延迟
         else:
             log_and_append("📺 观看任务：☕ 今日已达标")
 
         # 5. 模拟分享视频
         if not share_exp:
             share_url = "https://api.bilibili.com/x/web-interface/share/add"
-            # 修复5：增加了 aid 和 share_channel 参数，模拟真实“复制链接”的分享动作
             share_data = {
                 "aid": aid,
                 "bvid": bvid,
                 "csrf": csrf,
                 "share_channel": "copy"
             }
-            s_res = requests.post(share_url, data=share_data, headers=headers).json()
-            if s_res.get('code') == 0:
+            s_res = safe_request_json('POST', share_url, data=share_data, headers=headers)
+            if s_res and s_res.get('code') == 0:
                 log_and_append("↗️ 分享任务：✅ 已完成 (+5经验)")
             else:
-                log_and_append(f"↗️ 分享任务：❌ 失败 (code:{s_res.get('code')} - {s_res.get('message')})")
+                err_msg = s_res.get('message') if s_res else '接口解析失败'
+                log_and_append(f"↗️ 分享任务：❌ 失败 ({err_msg})")
             time.sleep(2) # 安全延迟
         else:
             log_and_append("↗️ 分享任务：☕ 今日已达标")
@@ -160,11 +186,12 @@ def do_bili_task(cookie, index):
                     "cross_domain": "true",
                     "csrf": csrf
                 }
-                c_res = requests.post(coin_url, data=coin_data, headers=headers).json()
-                if c_res.get('code') == 0:
+                c_res = safe_request_json('POST', coin_url, data=coin_data, headers=headers)
+                if c_res and c_res.get('code') == 0:
                     log_and_append(f"🪙 投币任务：✅ 成功投出{TOSS_COIN_COUNT}枚硬币 (+{TOSS_COIN_COUNT * 10}经验)")
                 else:
-                    log_and_append(f"🪙 投币任务：❌ 失败 (code:{c_res.get('code')} - {c_res.get('message')})")
+                    err_msg = f"code:{c_res.get('code')} - {c_res.get('message')}" if c_res else "接口解析失败"
+                    log_and_append(f"🪙 投币任务：❌ 失败 ({err_msg})")
             elif coin_exp >= target_coins_exp:
                 log_and_append(f"🪙 投币任务：☕ 今日投币量已达标")
             else:
@@ -173,7 +200,7 @@ def do_bili_task(cookie, index):
             log_and_append("🪙 投币任务：设置了不投币")
 
     except Exception as e:
-        msg = f"❌ 执行任务时发生错误: {e}"
+        msg = f"❌ 执行任务时发生未知错误: {e}"
         log_and_append(msg)
 
     return "\n".join(msg_list)
@@ -200,15 +227,11 @@ def get_cookies():
         return []
     # 支持换行或&符号分割多账号
     if '&' in cookie_str and 'bili_jct' not in cookie_str.split('&')[0]:
-         # 如果cookie内部本身不含&（bili_jct通常不含&，但cookie字段间用;），
-         # 这里假设用户用&分割了多个完整cookie字符串
          return [c.strip() for c in cookie_str.split('&') if c.strip()]
     
-    # 简单的按行分割，或者如果是一行且包含多个cookie（这种情况较少，通常是多行）
     if '\n' in cookie_str:
         return [c.strip() for c in cookie_str.split('\n') if c.strip()]
     
-    # 单个账号
     return [cookie_str]
 
 if __name__ == '__main__':
