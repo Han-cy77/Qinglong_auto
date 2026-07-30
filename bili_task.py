@@ -14,8 +14,10 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= 配置区域 =================
-BARK_URL = 'https://api.day.app/在此处添加自己的bark推送id'
+BARK_URL = os.getenv('BARK_URL', '').strip()
 TOSS_COIN_COUNT = 1  # 每天自动投币的数量 (0代表不投币，最多可填5。每天投1个最健康)
+REQUEST_TIMEOUT = 15
+ERROR_BODY_LIMIT = 200
 # ============================================
 
 def get_bili_csrf(cookie):
@@ -27,13 +29,95 @@ def get_bili_uid(cookie):
     match = re.search(r'DedeUserID=([^;]+)', cookie)
     return match.group(1) if match else "Unknown"
 
+
+def normalize_number(value):
+    """将接口中的数字字符串转成便于计算和展示的数字。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def get_bili_experience(data):
+    """读取 B站 nav 接口的当前经验值，兼容不同字段命名。"""
+    if not isinstance(data, dict):
+        return None
+    level_exp = data.get("level_exp")
+    level_info = data.get("level_info")
+    candidates = []
+    if isinstance(level_exp, dict):
+        candidates.extend(level_exp.get(key) for key in ("current_exp", "currentExp", "exp"))
+    if isinstance(level_info, dict):
+        candidates.extend(level_info.get(key) for key in ("current_exp", "currentExp", "exp"))
+    candidates.extend(data.get(key) for key in ("current_exp", "currentExp", "exp"))
+    for value in candidates:
+        normalized = normalize_number(value)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def format_experience(value):
+    return str(value) if value is not None else "未知"
+
+
+def compact_response_body(response, limit=ERROR_BODY_LIMIT):
+    """返回适合写入日志的响应片段，避免把整段 HTML/错误页刷进日志。"""
+    try:
+        body = response.text or ""
+    except Exception:
+        body = ""
+    body = " ".join(body.split())
+    return body[:limit] or "<empty body>"
+
+
+def request_json(method, url, log, **kwargs):
+    """请求并严格校验 JSON，避免 Issue #6 中的裸 JSONDecodeError。"""
+    kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+    try:
+        response = requests.request(method.upper(), url, **kwargs)
+    except requests.RequestException as exc:
+        log(f"❌ 请求失败 [{method.upper()} {url}]：{exc.__class__.__name__}: {exc}")
+        return None
+    except Exception as exc:
+        log(f"❌ 请求发生未知异常 [{method.upper()} {url}]：{exc}")
+        return None
+
+    content_type = response.headers.get("Content-Type", "")
+    if not response.ok:
+        log(
+            f"❌ 接口返回 HTTP {response.status_code} [{method.upper()} {url}]"
+            f"，响应片段：{compact_response_body(response)}"
+        )
+        return None
+
+    try:
+        payload = response.json()
+    except ValueError:
+        log(
+            f"❌ 接口返回非 JSON [{method.upper()} {url}]"
+            f"，状态码：{response.status_code}，Content-Type：{content_type or '未提供'}"
+            f"，响应片段：{compact_response_body(response)}"
+        )
+        return None
+
+    if not isinstance(payload, dict):
+        log(
+            f"❌ 接口 JSON 类型异常 [{method.upper()} {url}]："
+            f"期望 object，实际为 {type(payload).__name__}"
+        )
+        return None
+    return payload
+
 def setup_logger(account_name, task_name):
     log_dir = "logs"
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     
     date_str = datetime.datetime.now().strftime('%Y%m%d')
-    log_file = f"{log_dir}/{task_name}_{account_name}_{date_str}.log"
+    safe_name = "".join(c for c in str(account_name) if c.isalnum() or c in ('_', '-')) or "Unknown"
+    log_file = f"{log_dir}/{task_name}_{safe_name}_{date_str}.log"
     
     logger = logging.getLogger(f"{task_name}_{account_name}")
     logger.setLevel(logging.INFO)
@@ -76,46 +160,58 @@ def do_bili_task(cookie, index):
         logger.info(msg)
         msg_list.append(msg)
 
-    # ================= 安全请求拦截器 =================
-    def safe_request_json(method, url, **kwargs):
-        """安全地发起请求并解析 JSON，防止 B 站返回 HTML 导致报错"""
-        try:
-            if method.upper() == 'GET':
-                response = requests.get(url, **kwargs)
-            else:
-                response = requests.post(url, **kwargs)
-                
-            return response.json()
-        except requests.exceptions.JSONDecodeError:
-            log_and_append(f"❌ 接口被拦截！状态码: {response.status_code}")
-            log_and_append(f"⚠️ 返回异常内容片段: {response.text[:150]}")
-            return None
-        except Exception as e:
-            log_and_append(f"❌ 请求发生未知网络异常: {e}")
-            return None
-    # ==================================================
+    nav_url = "https://api.bilibili.com/x/web-interface/nav"
+    experience_before = None
+
+    def finish_report():
+        """任务结束前重新读取经验值，并把变化加入最终报告。"""
+        if experience_before is None:
+            log_and_append("📊 经验值：执行前无法从接口读取")
+            return "\n".join(msg_list)
+
+        final_res = request_json('GET', nav_url, log_and_append, headers=headers)
+        final_data = final_res.get('data') if final_res and final_res.get('code') == 0 else None
+        experience_after = get_bili_experience(final_data)
+        if experience_after is None:
+            log_and_append(
+                f"📊 经验值：执行前 {format_experience(experience_before)}，执行后无法读取"
+            )
+            return "\n".join(msg_list)
+
+        delta = experience_after - experience_before
+        delta_text = f"+{delta}" if delta >= 0 else str(delta)
+        log_and_append(
+            f"📊 经验值：执行前 {format_experience(experience_before)} → "
+            f"执行后 {format_experience(experience_after)}，本次增加 {delta_text}"
+        )
+        return "\n".join(msg_list)
 
     try:
         # 1. 检查登录状态并获取用户信息
-        nav_url = "https://api.bilibili.com/x/web-interface/nav"
-        res = safe_request_json('GET', nav_url, headers=headers)
+        res = request_json('GET', nav_url, log_and_append, headers=headers)
         if not res or res.get('code') != 0:
-            msg = "❌ 登录失效或接口被拦截，请检查 Cookie 或 IP 是否被风控！"
+            code = res.get('code') if res else '无响应'
+            api_message = res.get('message', '未返回接口消息') if res else '请查看上面的请求诊断'
+            msg = f"❌ 登录失效或接口被拦截（code: {code}，message: {api_message}）"
             log_and_append(msg)
             return "\n".join(msg_list)
 
-        data = res['data']
-        uname = data['uname']
-        level = data['level_info']['current_level']
-        coins = data['money']
+        data = res.get('data')
+        if not isinstance(data, dict):
+            log_and_append("❌ 登录接口返回缺少 data 对象，无法读取账号信息")
+            return "\n".join(msg_list)
+        uname = data.get('uname', 'Unknown')
+        level = data.get('level_info', {}).get('current_level', 'Unknown')
+        coins = data.get('money', 0)
+        experience_before = get_bili_experience(data)
         log_and_append(f"👤 账号：{uname} (Lv{level})")
         log_and_append(f"💰 硬币余额：{coins}枚")
 
         # 2. 获取今日任务完成状态
         reward_url = "https://api.bilibili.com/x/member/web/exp/reward"
-        reward_res = safe_request_json('GET', reward_url, headers=headers)
+        reward_res = request_json('GET', reward_url, log_and_append, headers=headers)
         if not reward_res:
-            return "\n".join(msg_list) # 接口被拦截，直接终止该账号后续任务
+            return finish_report() # 接口被拦截，直接终止该账号后续任务
             
         reward_data = reward_res.get('data', {})
         watch_exp = reward_data.get('watch')  # 是否完成观看
@@ -124,18 +220,24 @@ def do_bili_task(cookie, index):
 
         # 3. 获取 B 站全站热门推荐视频，避免重复投币
         popular_url = "https://api.bilibili.com/x/web-interface/popular?ps=50&pn=1"
-        pop_res = safe_request_json('GET', popular_url, headers=headers)
+        pop_res = request_json('GET', popular_url, log_and_append, headers=headers)
 
         if pop_res and pop_res.get('code') == 0:
-            video_list = pop_res['data']['list']
+            video_list = (pop_res.get('data') or {}).get('list')
+            if not isinstance(video_list, list) or not video_list:
+                log_and_append("❌ 推荐接口返回空视频列表，无法执行观看/分享任务")
+                return finish_report()
             random_video = random.choice(video_list)
-            bvid = random_video['bvid']
-            aid = random_video['aid']
-            video_title = random_video['title']
+            bvid = random_video.get('bvid')
+            aid = random_video.get('aid')
+            video_title = random_video.get('title', '未命名视频')
+            if not bvid or not aid:
+                log_and_append("❌ 推荐接口返回的视频缺少 bvid/aid，无法执行任务")
+                return finish_report()
         else:
-            msg = f"❌ 获取推荐视频失败: {pop_res.get('message') if pop_res else '接口被拦截'}"
+            msg = f"❌ 获取推荐视频失败：{pop_res.get('message') if pop_res else '请查看上面的请求诊断'}"
             log_and_append(msg)
-            return "\n".join(msg_list)
+            return finish_report()
 
         log_and_append(f"🎯 今日随机推荐视频：《{video_title[:10]}...》")
 
@@ -144,7 +246,7 @@ def do_bili_task(cookie, index):
             watch_url = "https://api.bilibili.com/x/click-interface/web/heartbeat"
             watch_data = {"aid": aid, "bvid": bvid, "csrf": csrf, "played_time": 300}
             
-            w_res = safe_request_json('POST', watch_url, data=watch_data, headers=headers)
+            w_res = request_json('POST', watch_url, log_and_append, data=watch_data, headers=headers)
             if w_res and w_res.get('code') == 0:
                 log_and_append("📺 观看任务：✅ 已完成 (+5经验)")
             else:
@@ -163,7 +265,7 @@ def do_bili_task(cookie, index):
                 "csrf": csrf,
                 "share_channel": "copy"
             }
-            s_res = safe_request_json('POST', share_url, data=share_data, headers=headers)
+            s_res = request_json('POST', share_url, log_and_append, data=share_data, headers=headers)
             if s_res and s_res.get('code') == 0:
                 log_and_append("↗️ 分享任务：✅ 已完成 (+5经验)")
             else:
@@ -186,7 +288,7 @@ def do_bili_task(cookie, index):
                     "cross_domain": "true",
                     "csrf": csrf
                 }
-                c_res = safe_request_json('POST', coin_url, data=coin_data, headers=headers)
+                c_res = request_json('POST', coin_url, log_and_append, data=coin_data, headers=headers)
                 if c_res and c_res.get('code') == 0:
                     log_and_append(f"🪙 投币任务：✅ 成功投出{TOSS_COIN_COUNT}枚硬币 (+{TOSS_COIN_COUNT * 10}经验)")
                 else:
@@ -203,7 +305,7 @@ def do_bili_task(cookie, index):
         msg = f"❌ 执行任务时发生未知错误: {e}"
         log_and_append(msg)
 
-    return "\n".join(msg_list)
+    return finish_report()
 
 
 def send_bark(title, content):
@@ -216,8 +318,8 @@ def send_bark(title, content):
         "icon": "https://cdn-icons-png.flaticon.com/512/3178/3178168.png"
     }
     try:
-        requests.post(base_url, json=data)
-    except:
+        requests.post(base_url, json=data, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
         pass
 
 
